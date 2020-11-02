@@ -6,6 +6,7 @@ module Deimos
   module Utils
     # Listener that can seek to get the last X messages in a topic.
     class SeekListener < Phobos::Listener
+      MAX_SEEK_RETRIES = 3
       attr_accessor :num_messages
 
       # :nodoc:
@@ -13,8 +14,10 @@ module Deimos
         @num_messages ||= 10
         @consumer = create_kafka_consumer
         @consumer.subscribe(topic, @subscribe_opts)
+        attempt = 0
 
         begin
+          attempt += 1
           last_offset = @kafka_client.last_offset_for(topic, 0)
           offset = last_offset - num_messages
           if offset.positive?
@@ -22,7 +25,8 @@ module Deimos
             @consumer.seek(topic, 0, offset)
           end
         rescue StandardError => e
-          "Could not seek to offset: #{e.message}"
+          retry if attempt < MAX_SEEK_RETRIES
+          log_error("Could not seek to offset: #{e.message} after #{MAX_SEEK_RETRIES} retries", listener_metadata)
         end
 
         instrument('listener.start_handler', listener_metadata) do
@@ -50,10 +54,9 @@ module Deimos
 
       # :nodoc:
       def consume(payload, metadata)
-        puts "Got #{payload}"
         self.class.total_messages << {
-          key: metadata[:key],
-          payload: payload
+            key: metadata[:key],
+            payload: payload
         }
       end
     end
@@ -102,10 +105,10 @@ module Deimos
       #   of messages in the topic, all messages will be consumed.
       def self.consume(topic:, frk_consumer:, num_messages: 10)
         listener = SeekListener.new(
-          handler: frk_consumer,
-          group_id: SecureRandom.hex,
-          topic: topic,
-          heartbeat_interval: 1
+            handler: frk_consumer,
+            group_id: SecureRandom.hex,
+            topic: topic,
+            heartbeat_interval: 1
         )
         listener.num_messages = num_messages
 
@@ -117,25 +120,25 @@ module Deimos
 
         subscribers = []
         subscribers << ActiveSupport::Notifications.
-          subscribe('phobos.listener.process_message') do
-            frk_consumer.last_message_time = Time.zone.now
-          end
+            subscribe('phobos.listener.process_message') do
+          frk_consumer.last_message_time = Time.zone.now
+        end
         subscribers << ActiveSupport::Notifications.
-          subscribe('phobos.listener.start_handler') do
-            frk_consumer.start_time = Time.zone.now
-            frk_consumer.last_message_time = nil
-          end
+            subscribe('phobos.listener.start_handler') do
+          frk_consumer.start_time = Time.zone.now
+          frk_consumer.last_message_time = nil
+        end
         subscribers << ActiveSupport::Notifications.
-          subscribe('heartbeat.consumer.kafka') do
-            if frk_consumer.last_message_time
-              if Time.zone.now - frk_consumer.last_message_time > MAX_MESSAGE_WAIT_TIME
-                raise Phobos::AbortError
-              end
-            elsif Time.zone.now - frk_consumer.start_time > MAX_TOPIC_WAIT_TIME
-              Deimos.config.logger.error('Aborting - initial wait too long')
+            subscribe('heartbeat.consumer.kafka') do
+          if frk_consumer.last_message_time
+            if Time.zone.now - frk_consumer.last_message_time > MAX_MESSAGE_WAIT_TIME
               raise Phobos::AbortError
             end
+          elsif Time.zone.now - frk_consumer.start_time > MAX_TOPIC_WAIT_TIME
+            Deimos.config.logger.error('Aborting - initial wait too long')
+            raise Phobos::AbortError
           end
+        end
         listener.start
         subscribers.each { |s| ActiveSupport::Notifications.unsubscribe(s) }
       end
